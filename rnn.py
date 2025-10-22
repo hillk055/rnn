@@ -1,9 +1,9 @@
-import pathlib
 import time
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import AutoTokenizer
 from pathlib import Path
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 import torch
 
@@ -53,6 +53,11 @@ class CustomDataset(Dataset):
         x = window[:-1]
         y = window[1:]
 
+        if (length_x := len(x)) < self.block_size:
+            pad_len = self.block_size - length_x
+            x = F.pad(x, (0, pad_len), mode='constant', value=-100)
+            y = F.pad(y, (0, pad_len), mode='constant', value=-100)
+
         # Why do we need long tensors
         x = torch.tensor(x, dtype=torch.long)
         y = torch.tensor(y, dtype=torch.long)
@@ -61,14 +66,75 @@ class CustomDataset(Dataset):
         return {'input_ids': x, 'labels': y}
 
 
-text = pathlib.Path('corpus.txt').read_text('utf-8')
+class RNNLanguageModel(nn.Module):
+
+    def __init__(self, tokeniser) -> None:
+        super().__init__()
+
+        vocab_size = tokeniser.vocab_size
+        self.embed = nn.Embedding(vocab_size, embedding_dim=128)
+        # Expects the first dimension of the tensor to be batch size
+        self.rnn = nn.RNN(128, batch_first=True, hidden_size=10)
+        # Fully connected layer take the in_features and returns a word in the completes the
+        # sequence with a word in the vocabulary
+        self.fc = nn.Linear(10, vocab_size)
+
+    def forward(self, x):
+
+        out = self.embed(x)
+        out, hidden = self.rnn(out)
+        out = self.fc(out)
+        return out
+
+
+text = Path('corpus.txt').read_text(encoding='utf-8')   # Encoding in utf-8 is standard practice
 
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+encoded = tokenizer.encode(text)
 
-encode = tokenizer.encode(text)
-ds = CustomDataset(encode)
+ds = CustomDataset(encoded)
 
-dl = DataLoader(ds, batch_size=1)
-print(next(iter(dl)))
+train_size = int(len(ds) * 0.8)
+test_size = len(ds) - train_size
+train_ds, test_ds = random_split(ds, [train_size, test_size])
+
+train_dl = DataLoader(train_ds, batch_size=2, shuffle=True)
+test_dl = DataLoader(test_ds, batch_size=2, shuffle=False)
+
+# Set up the model, criterion and optimiser for the model
+model = RNNLanguageModel(tokeniser=tokenizer)
+criterion = nn.CrossEntropyLoss(ignore_index=-100)
+optimiser = Adam(model.parameters(), lr=0.001)
+
+
+def train(model, dataloader, criterion, optimizer, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in dataloader:
+            inputs = batch['input_ids']        # [batch, seq_len]
+            targets = batch['labels']          # [batch, seq_len]
+
+            optimizer.zero_grad()
+            outputs = model(inputs)            # [batch, seq_len, vocab_size]
+
+            # Flatten for CrossEntropyLoss
+            batch_size, seq_len, vocab_size = outputs.shape
+            outputs = outputs.view(batch_size * seq_len, vocab_size)
+            targets = targets.view(-1)
+
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1} | Loss = {total_loss / len(dataloader):.4f}")
+
+
+
+# Run training
+train(model, train_dl, criterion, optimiser, epochs=40)
+
 
 
