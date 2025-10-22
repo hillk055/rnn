@@ -1,51 +1,74 @@
+import pathlib
+import time
+from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from pathlib import Path
 import torch.nn as nn
+from torch.optim import Adam
 import torch
 
 
-class RNNLanguageModel(nn.Module):
+class CustomDataset(Dataset):
 
-    def __init__(self, vocab_size):
-        super().__init__()
+    """
+    Data is split into windows where the time step = size of the window. If we had a sequence and one target variable we
+    miss out on t – 1 pair of data that could be used for training.
 
-        self.embed = nn.Embedding(vocab_size, embedding_dim=64)
-        # Expects the first dimension of the tensor to be batch size
-        self.rnn = nn.RNN(embedding_dim=64, batch_first=True, hidden_size=10)
-        # Fully connected layer take the in_features and returns a word in the completes the
-        # sequence with a word in the vocabulary
-        self.fc = nn.Linear(10, vocab_size)
+    E.G. input = [4, 3, 1, 2], target = [5] Given t = 5 datapoints we waste t – 1 = 4 datapoints.
+    If we set up like input = [4, 3, 1, 2], target = [3, 1, 2, 5] we have access to t-1 pairs of predictions.
+    This allows the model to learn dependencies and not waste time steps.
+    """
 
-    def forward(self, x):
+    def __init__(self, token_ids, block_size: int = 5, stride: int = 2) -> None:
 
-        out = self.embed(x)
-        out, hidden = self.rnn(out)
-        out = self.fc(out)
-        return out
+        self.token_ids = token_ids
+        self.block_size = block_size
+
+        # Create window slices in innit, executed once and then fetch from get_item
+
+        step = max(1, self.block_size - stride)
+        self.starts = list(range(0, len(token_ids) - 1, step))
+
+    def __len__(self) -> int:
+
+        """
+        When calling the dataloader it neets to know the length of the dataset to know how many times to call the
+        dataloader.
+        """
+
+        return len(self.starts)
+
+    def __getitem__(self, item: int) -> dict:
+
+        """
+        The dataloader iteratively accesses the windows. If it has a batch_size argument it will collect
+        multiple windows into a single tensor.
+
+        For padded tensors we also need to return a padded mask, that tells the model not to penalise predictions on
+        padded data
+        """
+
+        s = self.starts[item]
+        window = self.token_ids[s:s+self.block_size+1]
+        x = window[:-1]
+        y = window[1:]
+
+        # Why do we need long tensors
+        x = torch.tensor(x, dtype=torch.long)
+        y = torch.tensor(y, dtype=torch.long)
+
+        # Return padded mask as well
+        return {'input_ids': x, 'labels': y}
 
 
-text = Path('corpus.txt').read_text(encoding='utf-8')   # Encoding in utf-8 is standard practice
+text = pathlib.Path('corpus.txt').read_text('utf-8')
 
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-encoded = tokenizer(text, return_tensors='pt', truncation=True, add_special_tokens=True, return_overflowing_tokens=True,
-                    stride=32, max_length=96, padding='max_length')
-# Set truncation True and Max Length to limit the sie of the text
-# Special tokens are either sentence beginners or sentences breakers, marked in so the model has extra context
 
-# Next we need to batch inputs, we need some overlap so that the model can learn conditionality.
-# E.g. I liked up at the sky. The stars looked good. The model now knows that sky and starts can be used together
+encode = tokenizer.encode(text)
+ds = CustomDataset(encode)
 
-print(encoded['input_ids'].shape)   # Returns number of batches and the size of each batch
-vocab_sz = tokenizer.vocab_size
-
-# Set up the model, criterion and optimiser for the model
-model = RNNLanguageModel(vocab_size=vocab_sz)
-criterion = nn.CrossEntropyLoss()
-optimiser = torch.optim.ADAM(model.parameters(), lr=0.001)
-
-
-
-
-
+dl = DataLoader(ds, batch_size=1)
+print(next(iter(dl)))
 
 
